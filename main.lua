@@ -59,6 +59,130 @@ local mainTemplate = {
   }
 }
 
+-- GTNH 2.9 essentia fix: compare aspects by bare tag ("aer") so any naming
+-- format returned by getEssentiaInNetwork() matches the saved recipes.
+local function normalizeAspect(value)
+  if type(value) ~= "string" or value == "" then return nil end
+  local s = value:lower()
+  s = s:gsub("^.*:", "")
+  s = s:gsub("%s*super critical fluid$", "")
+  s = s:gsub("^gaseous(.-)essentia$", "%1")
+  s = s:gsub("^aspect%.", "")
+  s = s:match("^(%a+)") or s
+  return s
+end
+
+local function checkAspects(recipe)
+  local network = config.essentiaManager.mainMeInterfaceProxy.getEssentiaInNetwork() or {}
+  local available = {}
+
+  for _, entry in pairs(network) do
+    if type(entry) == "table" then
+      local key = normalizeAspect(entry.aspect) or normalizeAspect(entry.name) or normalizeAspect(entry.label)
+      local amount = tonumber(entry.amount or entry.size or entry.count) or 0
+      if key then
+        available[key] = (available[key] or 0) + amount
+      end
+    end
+  end
+
+  local missingAspects = {}
+  for _, recipeAspect in pairs(recipe.aspects) do
+    local key = normalizeAspect(recipeAspect.name)
+    local missing = recipeAspect.count - ((key and available[key]) or 0)
+    if missing > 0 then
+      table.insert(missingAspects, {name = recipeAspect.name, count = missing})
+    end
+  end
+
+  return missingAspects
+end
+
+-- GTNH 2.9 pattern fix: pattern slots now return the internal ID in `name`,
+-- the display name in `label` and the amount in `size` (no `count`).
+-- Essentia appears as a slot whose name is the bare aspect ("machina").
+local function slotCount(slot)
+  return tonumber(slot.size or slot.count or slot.amount or slot.stackSize) or 1
+end
+
+local function slotAspectKey(slot)
+  -- Only an exact aspect name counts ("machina"), never a label that merely
+  -- starts with one ("Aqua Infused Stone").
+  for _, field in ipairs({"aspect", "name"}) do
+    local value = slot[field]
+    if type(value) == "string" then
+      local aspect = value:lower():gsub("^.*:", "")
+      local key = "gaseous" .. aspect .. "essentia"
+      if aspect:match("^%a+$") and config.essentiaManager:getEssentiaByKey(key) then
+        return key
+      end
+    end
+  end
+  return nil
+end
+
+config.recipeManager.scanPatterns = function(self)
+  local patterns = {}
+  local slot = 1
+
+  while true do
+    local pattern = self.recipeMeInterfaceProxy.getInterfacePattern(slot)
+    if pattern == nil then break end
+
+    local output = pattern.outputs and pattern.outputs[1]
+
+    if output ~= nil then
+      local outputName = output.label or output.name
+
+      local parsedPattern = {
+        name = outputName,
+        result = {name = outputName, count = slotCount(output)},
+        slot = slot,
+        ingredients = {},
+        aspects = {}
+      }
+
+      for i, input in pairs(pattern.inputs or {}) do
+        if type(input) == "table" and (input.name or input.label) then
+          local aspectKey = slotAspectKey(input)
+
+          if aspectKey then
+            table.insert(parsedPattern.aspects, {
+              name = config.essentiaManager:getEssentiaByKey(aspectKey).name,
+              count = slotCount(input),
+              slot = i
+            })
+          else
+            local name = input.label or input.name
+            local isFound = false
+
+            for _, known in pairs(parsedPattern.ingredients) do
+              if known.name == name then
+                known.count = known.count + slotCount(input)
+                isFound = true
+                break
+              end
+            end
+
+            if not isFound then
+              table.insert(parsedPattern.ingredients, {name = name, count = slotCount(input)})
+            end
+          end
+        end
+      end
+
+      if #parsedPattern.ingredients > 0
+        and self:findRecipeByIngredients(parsedPattern.ingredients) == nil then
+        table.insert(patterns, parsedPattern)
+      end
+    end
+
+    slot = slot + 1
+  end
+
+  return patterns
+end
+
 local function init()
   gui:setTemplate(mainTemplate)
 
@@ -82,7 +206,7 @@ local function init()
 
   stateMachine.states.checkAspects = stateMachine:createState("Check Aspects")
   stateMachine.states.checkAspects.init = function()
-    local missingAspects = config.essentiaManager:checkAspects(stateMachine.data.recipe)
+    local missingAspects = checkAspects(stateMachine.data.recipe)
 
     if #missingAspects == 0 then
       stateMachine:setState(stateMachine.states.craft)
